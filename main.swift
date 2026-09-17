@@ -1,9 +1,10 @@
-// macOS で鳴っている音(ブラウザの Meet、電話アプリの通話音声など)を .m4a に録音する最小 CLI。
-// マイクは録音しません。Core Audio のプロセスタップ(macOS 14.2+)で全プロセスの出力音声を捕まえるので、
+// macOS で鳴っている音(ブラウザの Meet、電話アプリの通話音声など)とマイクの音を、別々の .m4a に録音する最小 CLI。
+// Core Audio のプロセスタップ(macOS 14.2+)で全プロセスの出力音声を捕まえるので、
 // ウィンドウを持たないデーモン(callservicesd / avconferenced)の音も対象になります。
+// マイクは同じ集約デバイスに入れて取り込むので、2 つのファイルはサンプル単位で揃います。
 //
 // ビルド: make
-// 実行:   ./record-audio   (実行ファイルと同じ場所の data/ に日時付きファイルで保存)
+// 実行:   ./record-audio   (実行ファイルと同じ場所の data/ に <日時>-system.m4a と <日時>-mic.m4a で保存)
 // 停止:   Ctrl+C(「保存完了」が出るまで待つ)
 
 import Accelerate
@@ -17,10 +18,14 @@ func check(_ status: OSStatus, _ what: String) throws {
     }
 }
 
+func address(_ selector: AudioObjectPropertySelector,
+             _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+}
+
 // AudioObject のグローバルプロパティを 1 つ読む。value には型を決めるための初期値を渡す。
 func readProperty<T>(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ value: T) throws -> T {
-    var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
-                                             mElement: kAudioObjectPropertyElementMain)
+    var address = address(selector)
     var value = value
     var size = UInt32(MemoryLayout<T>.size)
     try withUnsafeMutablePointer(to: &value) {
@@ -29,19 +34,78 @@ func readProperty<T>(_ object: AudioObjectID, _ selector: AudioObjectPropertySel
     return value
 }
 
+func deviceUID(_ device: AudioObjectID) throws -> String {
+    try readProperty(device, kAudioDevicePropertyDeviceUID, "" as CFString) as String
+}
+
+// 1 本の出力ファイル(システム音声かマイク)と、その音量計測。
+final class Track {
+    let name: String
+    let url: URL
+    private var file: AVAudioFile?
+    private var format: AVAudioFormat?
+    private var peak: Float = 0      // 直近の表示区間のピーク
+    private var maxPeak: Float = 0   // 録音全体のピーク
+
+    init(name: String, url: URL) { self.name = name; self.url = url }
+
+    // 最初のバッファでチャンネル数が分かるので、そのときにファイルを開く。
+    func write(_ buffer: AudioBuffer, sampleRate: Double) {
+        do {
+            if file == nil {
+                format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
+                                       channels: buffer.mNumberChannels, interleaved: true)
+                file = try AVAudioFile(forWriting: url, settings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: sampleRate,
+                    AVNumberOfChannelsKey: buffer.mNumberChannels,
+                ], commonFormat: .pcmFormatFloat32, interleaved: true)
+            }
+            var list = AudioBufferList(mNumberBuffers: 1, mBuffers: buffer)
+            try withUnsafePointer(to: &list) { list in
+                guard let format, let pcm = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: list) else { return }
+                try file?.write(from: pcm)
+            }
+        } catch {
+            fputs("\(name)の書き込みエラー: \(error.localizedDescription)\n", stderr)
+        }
+        var m: Float = 0
+        vDSP_maxmgv(buffer.mData!.assumingMemoryBound(to: Float.self), 1, &m, vDSP_Length(buffer.mDataByteSize / 4))
+        peak = max(peak, m)
+    }
+
+    // 表示区間のピークを文字列にして、次の区間へ進む。
+    func report() -> String {
+        defer { maxPeak = max(maxPeak, peak); peak = 0 }
+        return peak > 0 ? String(format: "%6.1f dB", 20 * log10(peak)) : "  無音  "
+    }
+
+    // file を解放するとヘッダが書かれて保存が完了する。
+    func close() {
+        file = nil
+        if max(maxPeak, peak) == 0 {
+            fputs("\n警告: \(name)は全て無音でした。許可設定を確認してください。\n", stderr)
+        }
+    }
+}
+
 final class Recorder {
     let queue = DispatchQueue(label: "record-audio.writer")
-    private let url: URL
+    private let system: Track
+    private let mic: Track
     private var tap = AudioObjectID(kAudioObjectUnknown)
     private var aggregate = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
-    private var file: AVAudioFile?
-    private var format: AVAudioFormat!
-    private var peak: Float = 0      // 直近 1 秒のピーク
-    private var maxPeak: Float = 0   // 録音全体のピーク
+    private var sampleRate: Double = 0
     private var lastReport = Date()
+    private(set) var micName = ""
 
-    init(url: URL) { self.url = url }
+    init(dir: URL, name: String) {
+        system = Track(name: "システム音声", url: dir.appendingPathComponent("\(name)-system.m4a"))
+        mic = Track(name: "マイク", url: dir.appendingPathComponent("\(name)-mic.m4a"))
+    }
+
+    var paths: String { "\(system.url.path)\n\(mic.url.path)" }
 
     func start() throws {
         // 全プロセスの出力をステレオにミックスするタップ(初回はシステムオーディオ録音の許可ダイアログが出る)
@@ -51,33 +115,32 @@ final class Recorder {
         description.muteBehavior = .unmuted
         try check(AudioHardwareCreateProcessTap(description, &tap), "プロセスタップの作成")
 
-        // タップを読み出すには、それを含む非公開の集約デバイスが必要。クロック源として既定の出力デバイスを入れる。
-        let output = try readProperty(AudioObjectID(kAudioObjectSystemObject),
-                                      kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID(kAudioObjectUnknown))
-        let outputUID = try readProperty(output, kAudioDevicePropertyDeviceUID, "" as CFString) as String
+        // タップと既定のマイクを 1 つの非公開の集約デバイスにまとめる。
+        // クロック源はマイク自身にする(AirPods は通話モードで 24 kHz になり、他のレートでは正しく届かない)。
+        // タップの音声は Core Audio がこのレートに合わせてくれる。入力バッファはマイク、タップの順に並ぶ。
+        let micDevice = try readProperty(AudioObjectID(kAudioObjectSystemObject),
+                                         kAudioHardwarePropertyDefaultInputDevice, AudioObjectID(kAudioObjectUnknown))
+        let micUID = try deviceUID(micDevice)
+        micName = try readProperty(micDevice, kAudioObjectPropertyName, "" as CFString) as String
         let composition: [String: Any] = [
             kAudioAggregateDeviceNameKey: "record-audio",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
-            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
+            kAudioAggregateDeviceMainSubDeviceKey: micUID,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: micUID]],
             kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: description.uuid.uuidString,
                                                kAudioSubTapDriftCompensationKey: true]],
         ]
         try check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &aggregate), "集約デバイスの作成")
 
-        var asbd = try readProperty(tap, kAudioTapPropertyFormat, AudioStreamBasicDescription())
-        guard let format = AVAudioFormat(streamDescription: &asbd) else {
-            throw NSError(domain: "record-audio", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "タップの音声フォーマットを解釈できません"])
+        // 開始直後にレートが変わることがある(AirPods の通話モード切替)ので、ファイルは最初のバッファで開く。
+        // 録音中に変わった場合はファイルのレートと合わなくなるので警告する。
+        var rateAddress = address(kAudioDevicePropertyNominalSampleRate)
+        AudioObjectAddPropertyListenerBlock(aggregate, &rateAddress, queue) { [unowned self] _, _ in
+            guard sampleRate != 0 else { return }
+            fputs("\n警告: 録音中にサンプルレートが変わりました。録音をやり直してください。\n", stderr)
         }
-        self.format = format
-        file = try AVAudioFile(forWriting: url, settings: [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: format.sampleRate,
-            AVNumberOfChannelsKey: format.channelCount,
-        ], commonFormat: format.commonFormat, interleaved: format.isInterleaved)
 
         try check(AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate, queue) { [unowned self] _, input, _, _, _ in
             self.write(input)
@@ -87,30 +150,22 @@ final class Recorder {
 
     // 音声バッファが届くたびに呼ばれる(queue 上)。
     private func write(_ input: UnsafePointer<AudioBufferList>) {
-        guard let pcm = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: input) else { return }
-        do { try file?.write(from: pcm) } catch {
-            fputs("書き込みエラー: \(error.localizedDescription)\n", stderr)
+        let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+        guard list.count >= 2 else { return }
+        if sampleRate == 0 {
+            sampleRate = (try? readProperty(aggregate, kAudioDevicePropertyNominalSampleRate, Double(0))) ?? 0
+            guard sampleRate != 0 else { return }
         }
-        measure(pcm)
-    }
+        mic.write(list[0], sampleRate: sampleRate)
+        system.write(list[list.count - 1], sampleRate: sampleRate)
 
-    // 音が届いているか確認できるよう、1 秒ごとにピーク音量を表示する。
-    private func measure(_ pcm: AVAudioPCMBuffer) {
-        guard let channels = pcm.floatChannelData else { return }
-        for c in 0..<Int(pcm.format.channelCount) {
-            var m: Float = 0
-            vDSP_maxmgv(channels[c], 1, &m, vDSP_Length(pcm.frameLength))
-            peak = max(peak, m)
-        }
+        // 音が届いているか確認できるよう、1 秒ごとにピーク音量を表示する。
         guard Date().timeIntervalSince(lastReport) >= 1 else { return }
-        let db = peak > 0 ? String(format: "%6.1f dB", 20 * log10(peak)) : "  無音  "
-        fputs("\r音量: \(db)  ", stderr)
-        maxPeak = max(maxPeak, peak)
-        peak = 0
+        fputs("\r音量: システム \(system.report()) / マイク \(mic.report())  ", stderr)
         lastReport = Date()
     }
 
-    // 停止してタップと集約デバイスを片付け、file を解放してヘッダを書き保存を完了する。
+    // 停止してタップと集約デバイスを片付け、ファイルを閉じて保存を完了する。
     func finish() {
         if let procID {
             AudioDeviceStop(aggregate, procID)
@@ -119,10 +174,8 @@ final class Recorder {
         AudioHardwareDestroyAggregateDevice(aggregate)
         AudioHardwareDestroyProcessTap(tap)
         queue.sync {
-            file = nil
-            if max(maxPeak, peak) == 0 {
-                fputs("\n警告: 録音データは全て無音でした。「システムオーディオ録音」の許可を確認してください。\n", stderr)
-            }
+            system.close()
+            mic.close()
         }
     }
 }
@@ -144,14 +197,13 @@ struct Main {
         // 実行ファイルの隣の data/ に、日時付きの名前で保存する(上書きしない)
         let dir = Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("data")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("system-audio-\(formatter.string(from: Date())).m4a")
 
-        let recorder = Recorder(url: url)
+        let recorder = Recorder(dir: dir, name: formatter.string(from: Date()))
         try recorder.start()
-        print("録音中 → \(url.path)\nCtrl+C で停止して保存します")
+        print("マイク: \(recorder.micName)\n録音中 →\n\(recorder.paths)\nCtrl+C で停止して保存します")
 
         await waitForSignal(SIGINT)
         recorder.finish()
-        print("\n保存完了: \(url.path)")
+        print("\n保存完了")
     }
 }
