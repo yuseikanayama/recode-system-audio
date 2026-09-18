@@ -35,7 +35,7 @@ Ctrl+C で停止し、「保存完了」が表示されたら終了です。
 [OpenAI Whisper](https://github.com/openai/whisper) でローカルに文字起こしします。
 
 ```sh
-brew install ffmpeg && uv tool install openai-whisper   # 初回のみ
+brew install ffmpeg && uv tool install --python 3.12 openai-whisper   # 初回のみ
 ./transcribe     # data/ の最新の録音を data/<日時>.txt に保存(引数で system ファイル指定も可)
 ```
 

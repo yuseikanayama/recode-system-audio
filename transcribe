@@ -1,15 +1,17 @@
 #!/bin/bash
 # data/ の録音(system + mic)を OpenAI Whisper で文字起こしし、時刻順にまとめる。
 #
-# 準備: brew install ffmpeg && uv tool install openai-whisper   (モデルは初回実行時に自動ダウンロード)
+# 準備: brew install ffmpeg && uv tool install --python 3.12 openai-whisper   (モデルは初回実行時に自動ダウンロード)
 # 実行: ./transcribe [data/<日時>-system.m4a]   (省略時は data/ の最新の録音)
 # 出力: data/<日時>.txt
 set -euo pipefail
-cd "$(dirname "$0")"
 
 # ファイル名が日時なので、名前の最大値が最新
-file=${1:-$(ls data/*-system.m4a | tail -1)}
+file=${1:-$(ls "$(dirname "$0")"/data/*-system.m4a | tail -1)}
 base=${file%-*.m4a}
+for f in "$base-system.m4a" "$base-mic.m4a"; do
+    [ -f "$f" ] || { echo "録音ファイルがありません: $f" >&2; exit 1; }
+done
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -27,7 +29,7 @@ label() {
 }
 
 { label system 相手; label mic 自分; } |
-    sort -n |
+    sort -ns |
     awk -F'\t' '{ s = int($1 / 1000); printf "[%02d:%02d:%02d] %s: %s\n", s / 3600, s % 3600 / 60, s % 60, $2, $3 }' |
     tee "$base.txt"
 echo "保存完了 → $base.txt" >&2
