@@ -1,0 +1,33 @@
+#!/bin/bash
+# data/ の録音(system + mic)を OpenAI Whisper で文字起こしし、時刻順にまとめる。
+#
+# 準備: brew install ffmpeg && uv tool install openai-whisper   (モデルは初回実行時に自動ダウンロード)
+# 実行: ./transcribe [data/<日時>-system.m4a]   (省略時は data/ の最新の録音)
+# 出力: data/<日時>.txt
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# ファイル名が日時なので、名前の最大値が最新
+file=${1:-$(ls data/*-system.m4a | tail -1)}
+base=${file%-*.m4a}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# 2 本まとめて渡すとモデルの読み込みが 1 回で済む。tsv は「開始ms 終了ms 本文」
+# CPU で動かす(MPS は fp16 だと NaN、fp32 だと内容が抜ける)。
+# 前の出力を文脈に使わないことで、無音区間で同じ言葉を繰り返す幻覚を防ぐ
+whisper "$base-system.m4a" "$base-mic.m4a" --model turbo --language ja --fp16 False \
+    --condition_on_previous_text False \
+    --output_format tsv --output_dir "$tmp" --verbose False
+
+# 見出し行を除き、「開始ms 話者 本文」にする
+label() {
+    awk -F'\t' -v who="$2" 'NR > 1 { print $1 "\t" who "\t" $3 }' "$tmp/$(basename "$base")-$1.tsv"
+}
+
+{ label system 相手; label mic 自分; } |
+    sort -n |
+    awk -F'\t' '{ s = int($1 / 1000); printf "[%02d:%02d:%02d] %s: %s\n", s / 3600, s % 3600 / 60, s % 60, $2, $3 }' |
+    tee "$base.txt"
+echo "保存完了 → $base.txt" >&2

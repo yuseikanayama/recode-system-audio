@@ -30,6 +30,18 @@ Ctrl+C で停止し、「保存完了」が表示されたら終了です。
 
 会議や通話を録音するときは、事前に相手の同意を得てください。
 
+## 文字起こし
+
+[OpenAI Whisper](https://github.com/openai/whisper) でローカルに文字起こしします。
+
+```sh
+brew install ffmpeg && uv tool install openai-whisper   # 初回のみ
+./transcribe     # data/ の最新の録音を data/<日時>.txt に保存(引数で system ファイル指定も可)
+```
+
+system を「相手」、mic を「自分」として別々に文字起こしし、時刻順に 1 つにまとめます。
+モデル(turbo、約 1.5 GB)は初回実行時に `~/.cache/whisper` へダウンロードされます。
+
 ## 権限
 
 初回実行時に「システムオーディオ録音」と「マイク」の許可ダイアログが出ます。
