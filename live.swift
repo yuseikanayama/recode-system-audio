@@ -104,11 +104,16 @@ final class LiveStream {
         return try drain()
     }
 
-    // 残りの音声を認識しきって、ストリームを閉じる。
+    // 残りの音声を認識しきる。
     func finish() throws -> [String] {
-        defer { nemo_speech_asr_stream_close(stream) }
         try asrCheck(nemo_speech_asr_stream_finish(stream), "ストリームの終了")
         return try drain()
+    }
+
+    // recognizer を解放する前に呼ぶ。
+    func close() {
+        nemo_speech_asr_stream_close(stream)
+        stream = nil
     }
 
     // 今の時点で出ている結果をすべて受け取る。
@@ -165,7 +170,8 @@ final class Transcriber: @unchecked Sendable {
     private var failed = false
     private var levels = ""
     private var partial = (who: "", text: "")
-    private var status: String? = ""   // 最下部に今出ている内容(nil なら表示をやめている)
+    // 最下部に今出ている内容。nil なら出さない(端末でないときと、終了処理に入ってから)。
+    private var status: String? = isatty(fileno(console)) != 0 ? "" : nil
 
     init(recognizer: OpaquePointer, url: URL) throws {
         mic = try LiveStream("自分", recognizer: recognizer)
@@ -173,9 +179,12 @@ final class Transcriber: @unchecked Sendable {
         self.url = url
         FileManager.default.createFile(atPath: url.path, contents: nil)
         file = try FileHandle(forWritingTo: url)
-        // 2 人が同時に話しているときは、後から更新されたほうを表示する。
-        mic.onPartial = { [unowned self] in partial = ($0, $1) }
-        system.onPartial = { [unowned self] in partial = ($0, $1) }
+        // 2 人が同時に話しているときは、後から更新されたほうを表示する。確定で消すのは自分の文だけ。
+        let onPartial: (String, String) -> Void = { [unowned self] who, text in
+            if !text.isEmpty || partial.who == who { partial = (who, text) }
+        }
+        mic.onPartial = onPartial
+        system.onPartial = onPartial
     }
 
     func showLevels(_ text: String) {
@@ -194,7 +203,7 @@ final class Transcriber: @unchecked Sendable {
     // 最下部の表示を消して、以後は出さない(録音の終了時の警告と混ざらないよう、先に呼ぶ)。
     func hideStatus() {
         queue.sync {
-            fputs("\r\u{1B}[J", console)
+            if status != nil { fputs("\r\u{1B}[J", console) }
             status = nil
         }
     }
@@ -202,7 +211,11 @@ final class Transcriber: @unchecked Sendable {
     // 溜まっている音声を認識しきるまで待つ。
     // 長い発話ほど遅れて確定するので、ファイルは最後に発話の開始順(同時刻なら確定順)へ並べ直す。
     func finish() throws {
-        queue.sync { emit { try mic.finish() + system.finish() } }
+        queue.sync {
+            emit { try mic.finish() + system.finish() }
+            mic.close()
+            system.close()
+        }
         let sorted = lines.enumerated().sorted { ($0.element.prefix(10), $0.offset) < ($1.element.prefix(10), $1.offset) }
         try sorted.map { $0.element + "\n" }.joined().write(to: url, atomically: true, encoding: .utf8)
     }
