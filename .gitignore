@@ -2,3 +2,4 @@ record-audio
 play-audio
 data/
 .DS_Store
+live-transcribe

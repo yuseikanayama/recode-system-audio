@@ -1,4 +1,4 @@
-// システム音声とマイクを別々の .m4a に録音する部分。
+// システム音声とマイクを別々の .m4a に録音する部分。record-audio と live-transcribe で共有する。
 // Core Audio のプロセスタップ(macOS 14.2+)で全プロセスの出力音声を捕まえるので、
 // ウィンドウを持たないデーモン(callservicesd / avconferenced)の音も対象になります。
 // マイクは同じ集約デバイスに入れて取り込むので、2 つのファイルはサンプル単位で揃います。
@@ -6,6 +6,9 @@
 import Accelerate
 import AVFoundation
 import CoreAudio
+
+// 状況表示の出力先(live-transcribe が差し替える)
+var console = stderr
 
 func check(_ status: OSStatus, _ what: String) throws {
     guard status == noErr else {
@@ -63,7 +66,7 @@ final class Track {
                 try file?.write(from: pcm)
             }
         } catch {
-            fputs("\(name)の書き込みエラー: \(error.localizedDescription)\n", stderr)
+            fputs("\(name)の書き込みエラー: \(error.localizedDescription)\n", console)
         }
         var m: Float = 0
         vDSP_maxmgv(buffer.mData!.assumingMemoryBound(to: Float.self), 1, &m, vDSP_Length(buffer.mDataByteSize / 4))
@@ -80,7 +83,7 @@ final class Track {
     func close() {
         file = nil
         if max(maxPeak, peak) == 0 {
-            fputs("\n警告: \(name)は全て無音でした。許可設定を確認してください。\n", stderr)
+            fputs("\n警告: \(name)は全て無音でした。許可設定を確認してください。\n", console)
         }
     }
 }
@@ -95,6 +98,10 @@ final class Recorder {
     private var sampleRate: Double = 0
     private var lastReport = Date()
     private(set) var micName = ""
+    // 録音と同じ音声を受け取る(queue 上で呼ばれる)。バッファは呼び出しの間だけ有効。
+    var onAudio: ((_ mic: AudioBuffer, _ system: AudioBuffer, _ sampleRate: Double) -> Void)?
+    // 1 秒ごとの音量表示(queue 上で呼ばれる)。差し替えると、表示する代わりに文字列を受け取れる。
+    var onLevels: (String) -> Void = { fputs("\r\($0)  ", console) }
 
     init(dir: URL, name: String) {
         system = Track(name: "システム音声", url: dir.appendingPathComponent("\(name)-system.m4a"))
@@ -135,7 +142,7 @@ final class Recorder {
         var rateAddress = address(kAudioDevicePropertyNominalSampleRate)
         AudioObjectAddPropertyListenerBlock(aggregate, &rateAddress, queue) { [unowned self] _, _ in
             guard sampleRate != 0 else { return }
-            fputs("\n警告: 録音中にサンプルレートが変わりました。録音をやり直してください。\n", stderr)
+            fputs("\n警告: 録音中にサンプルレートが変わりました。録音をやり直してください。\n", console)
         }
 
         try check(AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate, queue) { [unowned self] _, input, _, _, _ in
@@ -154,10 +161,11 @@ final class Recorder {
         }
         mic.write(list[0], sampleRate: sampleRate)
         system.write(list[list.count - 1], sampleRate: sampleRate)
+        onAudio?(list[0], list[list.count - 1], sampleRate)
 
         // 音が届いているか確認できるよう、1 秒ごとにピーク音量を表示する。
         guard Date().timeIntervalSince(lastReport) >= 1 else { return }
-        fputs("\r音量: システム \(system.report()) / マイク \(mic.report())  ", stderr)
+        onLevels("音量: システム \(system.report()) / マイク \(mic.report())")
         lastReport = Date()
     }
 
