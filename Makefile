@@ -11,7 +11,7 @@ play-audio: play.swift
 	$(SWIFTC) $< -o $@
 
 live-transcribe: live.swift recorder.swift
-	$(SWIFTC) $^ -import-objc-header "$(NEMO)/include/nemo_speech/asr.h" \
+	$(SWIFTC) $^ -import-objc-header "$(NEMO)/include/nemo_speech/diar.h" -I "$(NEMO)/include" \
 		-L "$(NEMO)/lib" -lnemo_speech_asr_c -Xlinker -rpath -Xlinker "$(NEMO)/lib" -o $@
 
 clean:

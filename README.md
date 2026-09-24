@@ -48,15 +48,20 @@ system を「相手」、mic を「自分」として別々に文字起こしし
 推論は NVIDIA 公式のローカル実行環境 [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp)(Metal)で行い、音声はこの Mac の外に出ません。
 
 ```sh
-# 初回のみ: NeMo-Speech.cpp と、NVIDIA 公式の GGUF(約 740 MB)を入れる
+# 初回のみ: NeMo-Speech.cpp と、NVIDIA 公式の GGUF(認識 約 740 MB、話者分離 約 150 MB)を入れる
 curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
 ~/.local/bin/nemo-speech pull nemotron-3.5
+~/.local/bin/nemo-speech pull sortformer
 make live-transcribe
 
-./live-transcribe   # 録音は record-audio と同じ。文字起こしは data/<日時>-live.txt にも保存
+./live-transcribe               # 録音は record-audio と同じ。文字起こしは data/<日時>-live.txt にも保存
+./live-transcribe --in-person   # 対面の会議(マイクに複数人の声が入る)
 ```
 
 system を「相手」、mic を「自分」として認識し、0.8 秒の無音で発話が区切れるたびに 1 行確定します。
+相手が複数いるときは [Streaming Sortformer](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) で声を聞き分け、「相手1」「相手2」のように番号で区別します(最大 4 人。番号は声の登場順で、名前は付きません)。
+`--in-person` を付けると mic も同じように聞き分け、自分を含めて「話者1」「話者2」のようになります。
+話者の聞き分けは声を覚えるまでの最初の 20〜30 秒ほど定まらず、その間は全員が同じ番号になりがちです。
 画面の一番下には `record-audio` と同じ 1 秒ごとのピーク音量が、その上の行には認識途中の文が表示されます。
 遅延は 1 秒ほどです。起動時のモデルの読み込みに 10 秒ほどかかります。
 ストリーミング認識は先の文脈を見られないぶん精度が落ちるので、議事録には録音後の `./transcribe` を使ってください。
