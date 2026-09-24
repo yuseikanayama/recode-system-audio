@@ -127,15 +127,13 @@ final class LiveStream {
     // 音声を渡し、確定した発話を「[時刻] 話者: 本文」の行で返す。サンプルレートの変換は SDK がやってくれる。
     func push(_ samples: [Float], sampleRate: Double) throws -> [String] {
         try asrCheck(nemo_speech_asr_stream_push_f32(stream, samples, samples.count, Int32(sampleRate)), "音声の受け渡し")
-        if let diar {
-            try asrCheck(nemo_speech_diar_stream_push_f32(diar, samples, samples.count, Int32(sampleRate)), "話者分離への受け渡し")
-        }
+        _ = withDiar("話者分離への受け渡し") { nemo_speech_diar_stream_push_f32($0, samples, samples.count, Int32(sampleRate)) }
         return try drain()
     }
 
     // 残りの音声を認識しきる。
     func finish() throws -> [String] {
-        if let diar { try asrCheck(nemo_speech_diar_stream_finish(diar), "話者分離の終了") }
+        _ = withDiar("話者分離の終了") { nemo_speech_diar_stream_finish($0) }
         try asrCheck(nemo_speech_asr_stream_finish(stream), "ストリームの終了")
         return try drain()
     }
@@ -148,16 +146,28 @@ final class LiveStream {
         diar = nil
     }
 
+    // 話者分離を 1 回呼ぶ。付加機能なので、失敗しても止めるのは話者分離だけで、文字起こしは番号なしで続ける。
+    private func withDiar(_ what: String, _ call: (OpaquePointer) -> nemo_speech_asr_status) -> Bool {
+        guard let diar else { return false }
+        if call(diar) == NEMO_SPEECH_ASR_OK { return true }
+        let reason = String(cString: nemo_speech_asr_last_error())
+        fputs("\n話者分離を停止しました(文字起こしは続きます): \(what)に失敗しました: \(reason)\n", console)
+        nemo_speech_diar_stream_close(diar)
+        self.diar = nil
+        return false
+    }
+
     // 発話の時間帯に最も長く重なっている話者(1 始まり)。話者分離なし、または重なりが無ければ 0。
-    private func speaker(of result: OpaquePointer) throws -> Int32 {
+    // 区間の後処理はストリーム全体に及ぶので、確定した発話にだけ使う。
+    private func speaker(of result: OpaquePointer) -> Int32 {
         let words = nemo_speech_asr_result_word_count(result, 0)
-        guard let diar, words > 0 else { return 0 }
+        guard diar != nil, words > 0 else { return 0 }
         let from = Double(nemo_speech_asr_result_word_start_time(result, 0, 0)) / 1000
         let to = Double(nemo_speech_asr_result_word_end_time(result, 0, words - 1)) / 1000
         var count = 0
-        try asrCheck(nemo_speech_diar_segments(diar, nil, nil, 0, &count), "話者分離の結果")
+        guard withDiar("話者分離の結果", { nemo_speech_diar_segments($0, nil, nil, 0, &count) }) else { return 0 }
         var segments = [nemo_speech_diar_segment](repeating: nemo_speech_diar_segment(), count: count)
-        try asrCheck(nemo_speech_diar_segments(diar, nil, &segments, count, &count), "話者分離の結果")
+        guard withDiar("話者分離の結果", { nemo_speech_diar_segments($0, nil, &segments, count, &count) }) else { return 0 }
         var overlap: [Int32: Double] = [:]
         for segment in segments.prefix(count) {
             let length = min(to, segment.end_time) - max(from, segment.start_time)
@@ -177,10 +187,10 @@ final class LiveStream {
             guard nemo_speech_asr_result_alternative_count(result) > 0 else { continue }
             let text = String(cString: nemo_speech_asr_result_transcript(result, 0)).trimmingCharacters(in: .whitespaces)
             let s = Int(start ?? nemo_speech_asr_result_audio_processed(result))
-            let tag = try speaker(of: result)
-            let who = tag > 0 ? "\(who)\(tag)" : who
             if nemo_speech_asr_result_is_final(result) {
                 if !text.isEmpty {
+                    let tag = speaker(of: result)
+                    let who = tag > 0 ? "\(who)\(tag)" : who
                     lines.append(String(format: "[%02d:%02d:%02d] %@: %@", s / 3600, s % 3600 / 60, s % 60, who, text))
                 }
                 start = nil
@@ -232,9 +242,8 @@ final class Transcriber: @unchecked Sendable {
         FileManager.default.createFile(atPath: url.path, contents: nil)
         file = try FileHandle(forWritingTo: url)
         // 複数人が同時に話しているときは、後から更新されたほうを表示する。確定で消すのは自分の文だけ。
-        // 話者分離では認識の途中で番号が変わることがあるので、同じストリームかどうかは番号を除いて比べる。
         let onPartial: (String, String) -> Void = { [unowned self] who, text in
-            if !text.isEmpty || partial.who.prefix(2) == who.prefix(2) { partial = (who, text) }
+            if !text.isEmpty || partial.who == who { partial = (who, text) }
         }
         mic.onPartial = onPartial
         system.onPartial = onPartial
