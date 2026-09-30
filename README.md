@@ -56,6 +56,7 @@ make live-transcribe
 
 ./live-transcribe               # 録音は record-audio と同じ。文字起こしは data/<日時>-live.txt にも保存
 ./live-transcribe --in-person   # 対面の会議(マイクに複数人の声が入る)
+./live-transcribe --model apple # 認識に Apple の SpeechTranscriber を使う(macOS 26 以降)
 ```
 
 system を「相手」、mic を「自分」として認識し、0.8 秒の無音で発話が区切れるたびに 1 行確定します。
@@ -65,6 +66,17 @@ system を「相手」、mic を「自分」として認識し、0.8 秒の無�
 画面の一番下には `record-audio` と同じ 1 秒ごとのピーク音量が、その上の行には認識途中の文が表示されます。
 遅延は 1 秒ほどです。起動時のモデルの読み込みに 10 秒ほどかかります。
 ストリーミング認識は先の文脈を見られないぶん精度が落ちるので、議事録には録音後の `./transcribe` を使ってください。
+
+`--model` で認識のモデルを選べます。既定は `nemotron` です。
+
+| `--model` | 認識 |
+|---|---|
+| `nemotron`(既定) | NVIDIA Nemotron 3.5 ASR Streaming |
+| `apple` | Apple の [SpeechTranscriber](https://developer.apple.com/documentation/speech/speechtranscriber)(macOS 26 以降)。日本語のモデルは初回に OS がダウンロードします。こちらもオンデバイスです |
+| `<パス>.gguf` | 指定した GGUF(NeMo-Speech.cpp で読めるもの) |
+
+`apple` でも、話者の聞き分けには同じ Streaming Sortformer を使います。
+`apple` は文の切れ目で確定するので、1 行が長くなり、確定までにかかる時間も長くなりがちです。
 
 ## リアルタイム議事録
 
