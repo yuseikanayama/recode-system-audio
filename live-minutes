@@ -1,0 +1,143 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["claude-agent-sdk"]
+# ///
+# live-transcribe が data/<日時>-live.txt に追記する発言を追いかけ、Claude が議事録を書き続ける。
+# 決まったこと・ネクストアクション・未決の論点・漏れているかもしれない観点を、会議中に画面で確認できる。
+# Claude には毎回「今の議事録」と「前回の更新以降の発言」だけを渡す(Claude Agent SDK。セッションは使わない)。
+# 更新のたびに claude を起動する(常駐させると端末の Ctrl+C が子プロセスにも届いて壊れる)。
+# 課金が止まらなくなる事故を防ぐため、1 回の呼び出しに時間と金額の上限を付け、失敗が続いたときと
+# 文字起こしが止まって久しいとき、長時間動き続けたときは自分から終了する。終了時は SDK が子プロセスを止める。
+#
+# 準備: Claude Code にログイン済みであること(claude コマンドが動くこと)。uv があれば依存は自動で入る
+# 実行: ./live-minutes [data/<日時>-live.txt]   (省略時は data/ の最新。./live-transcribe と別の端末で動かす)
+# 出力: data/<日時>-minutes.md(更新のたびに上書き)
+# 停止: Ctrl+C(残っている発言をまとめてから終わる)
+import asyncio
+import signal
+import sys
+import time
+from pathlib import Path
+
+import anyio
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
+
+INTERVAL = 60  # 秒。この間隔で新しい発言をまとめて送る
+MODEL = "claude-opus-5"
+# フェールセーフ
+CALL_TIMEOUT = 180       # 秒。1 回の呼び出しがこれを超えたら打ち切る(子プロセスも止める)
+CALL_BUDGET_USD = 1.0    # 1 回の呼び出しの金額上限(通常は数セント)
+MAX_FAILURES = 3         # 連続で失敗したら終了する
+IDLE_LIMIT = 30 * 60     # 秒。文字起こしがこれだけ増えなければ終了する(会議が終わったのに動き続けない)
+MAX_RUNTIME = 4 * 3600   # 秒。これ以上は動き続けない
+
+SYSTEM = """あなたは会議のリアルタイム議事録係です。参加者が会議をしながら横目で読むものなので、一目で分かる短さにします。
+「今の議事録」と「前回の更新以降の発言」を渡すので、議事録を更新して全文だけを出力してください。前置きや説明は書きません。
+
+# 議事録
+## 決まったこと
+## ネクストアクション
+- 内容(担当: 名前または不明、期日: 日付または未定)
+## 未決の論点
+## 漏れているかもしれない観点
+
+書き方:
+- 1 項目 1 行、体言止めで 30 字程度まで。理由や経緯は書かない
+- 各節は 5 項目まで。多くなったら重要なものに絞る
+- 「漏れているかもしれない観点」は、担当・期日・前提・リスクのうち本当に確認が要るものを 3 項目まで
+- 新しい発言で内容が変わったら既存の項目を直し、決まったことは未決から移す。まだ何もない節は「(なし)」
+- 文字起こしは音声認識なので誤字や聞き間違いを含む。文脈から補って読み、確信が持てない固有名詞はそのまま書く
+- 話者は文字起こしの呼び方のまま(「自分」は録音している本人、「相手N」「話者N」は他の参加者)"""
+
+
+def latest_transcript() -> Path:
+    files = sorted((Path(__file__).resolve().parent / "data").glob("*-live.txt"))
+    if not files:
+        sys.exit("文字起こしがありません。先に ./live-transcribe を動かしてください")
+    return files[-1]
+
+
+# offset 以降に追記された行を読む。終了時に live-transcribe がファイルを並べ直して縮むことがあるので、そのときは追わない。
+def read_new(path: Path, offset: int) -> tuple[str, int]:
+    data = path.read_bytes()
+    if len(data) < offset:
+        return "", len(data)
+    chunk = data[offset:]
+    end = chunk.rfind(b"\n") + 1  # 書きかけの行は次回に回す
+    return chunk[:end].decode("utf-8", errors="replace"), offset + end
+
+
+# Claude に 1 回聞いて本文を返す。途中で子プロセスが死んだとき、時間や金額の上限を超えたときは例外。
+# タイムアウトは anyio のキャンセルで行う(asyncio.wait_for だと SDK が子プロセスを止め損ねることがある)。
+async def ask(prompt: str, cwd: Path) -> str:
+    options = ClaudeAgentOptions(system_prompt=SYSTEM, model=MODEL, tools=[], cwd=str(cwd),
+                                 max_turns=1, max_budget_usd=CALL_BUDGET_USD)
+    text, result = "", None
+    with anyio.fail_after(CALL_TIMEOUT):
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                text += "".join(block.text for block in message.content if isinstance(block, TextBlock))
+            elif isinstance(message, ResultMessage):
+                result = message
+    if result is None or result.is_error or not text.strip():
+        raise RuntimeError(result.result if result and result.result else "Claude から応答がありませんでした")
+    return text.strip()
+
+
+def show(minutes: str, lines: int, path: Path) -> None:
+    print("\033[2J\033[H" + minutes)
+    print(f"\n--- {time.strftime('%H:%M:%S')} 更新 / 発言 {lines} 行 / {path}", flush=True)
+
+
+async def main() -> None:
+    transcript = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else latest_transcript()
+    minutes_path = transcript.with_name(transcript.name.replace("-live.txt", "-minutes.md"))
+    stop = asyncio.Event()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGINT, stop.set)
+
+    offset, lines, pending, minutes, retried = 0, 0, "", "(まだありません)", False
+    started = last_growth = time.monotonic()
+    failures = 0
+    print(f"{transcript} を追いかけています。議事録 → {minutes_path}\nCtrl+C で停止します", flush=True)
+    while True:
+        new, offset = read_new(transcript, offset)
+        pending += new   # 送れなかった分は次回にまとめて送る
+        if new:
+            last_growth = time.monotonic()
+        if pending:
+            prompt = f"## 今の議事録\n\n{minutes}\n\n## 前回の更新以降の発言\n\n{pending}"
+            try:
+                minutes = await ask(prompt, transcript.parent.parent)
+            except Exception as e:
+                failures += 1
+                print(f"\n議事録の更新に失敗しました({failures} 回目、次回まとめて送ります): {e or type(e).__name__}", file=sys.stderr, flush=True)
+                if failures >= MAX_FAILURES:
+                    print(f"{MAX_FAILURES} 回続けて失敗したので終了します", file=sys.stderr, flush=True)
+                    break
+            else:
+                failures = 0
+                lines += pending.count("\n")
+                pending = ""
+                minutes_path.write_text(minutes + "\n", encoding="utf-8")
+                show(minutes, lines, minutes_path)
+        if time.monotonic() - last_growth > IDLE_LIMIT:
+            print(f"文字起こしが {IDLE_LIMIT // 60} 分増えていないので終了します", flush=True)
+            break
+        if time.monotonic() - started > MAX_RUNTIME:
+            print(f"{MAX_RUNTIME // 3600} 時間たったので終了します", flush=True)
+            break
+        if stop.is_set():
+            # Ctrl+C は claude の子プロセスにも届き、送信中だった更新は失敗する。新しいプロセスで 1 回だけやり直す
+            if pending and not retried:
+                retried = True
+                continue
+            break
+        try:
+            await asyncio.wait_for(stop.wait(), INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+    print("保存完了" if not pending else "未送信の発言が残ったまま終了しました", flush=True)
+
+
+asyncio.run(main())
