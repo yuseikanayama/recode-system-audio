@@ -400,6 +400,9 @@ final class Transcriber: @unchecked Sendable {
     private var partial = (who: "", text: "")
     // 最下部に今出ている内容。nil なら出さない(端末でないときと、終了処理に入ってから)。
     private var status: String? = isatty(fileno(console)) != 0 ? "" : nil
+    // 端末でないとき(TUI から動かすとき)は、最下部の代わりに変わった内容を「認識中: 」「音量: 」の 2 行で出す。
+    // 最後に出した内容。nil なら出さない(端末のときと、終了処理に入ってから)。
+    private var reported: String? = isatty(fileno(console)) != 0 ? nil : ""
 
     init(mic: SpeechStream, system: SpeechStream, url: URL) throws {
         self.mic = mic
@@ -433,6 +436,7 @@ final class Transcriber: @unchecked Sendable {
         queue.sync {
             if status != nil { fputs("\r\u{1B}[J", console) }
             status = nil
+            reported = nil
         }
     }
 
@@ -472,6 +476,7 @@ final class Transcriber: @unchecked Sendable {
     // 内容が変わっていたら最下部の 2 行を描き直す。
     // 折り返すと上書きできなくなるので、認識途中の文は端末の幅に収まる末尾だけを出す。
     private func drawStatus() {
+        report()
         guard status != nil else { return }
         var size = winsize()
         let width = ioctl(fileno(console), TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? Int(size.ws_col) : 80
@@ -482,6 +487,14 @@ final class Transcriber: @unchecked Sendable {
         guard next != status else { return }
         status = next
         fputs("\r\u{1B}[K\(next)\u{1B}[1A\r", console)
+    }
+
+    private func report() {
+        guard let reported else { return }
+        let next = "認識中: \(partial.text.isEmpty ? "" : "\(partial.who): \(partial.text)")\n\(levels)\n"
+        guard next != reported else { return }
+        self.reported = next
+        fputs(next, console)
     }
 }
 
@@ -545,6 +558,7 @@ struct Main {
         }
         try recorder.start()
         print("マイク: \(recorder.micName)\n録音中 →\n\(recorder.paths)\n\(textURL.path)\nCtrl+C で停止して保存します")
+        fflush(stdout)
 
         await waitForSignal(SIGINT)
         transcriber.hideStatus()

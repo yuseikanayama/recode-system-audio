@@ -1,0 +1,11 @@
+{
+  "name": "live-tui",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@opentui/core": "^0.5.14"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
