@@ -1,5 +1,6 @@
 // record-audio と同じ録音をしながら、NVIDIA Nemotron 3.5 ASR Streaming でリアルタイムに文字起こしする。
 // 推論は NVIDIA 公式のローカル実行環境 NeMo-Speech.cpp の C SDK で行い、音声はこの Mac の外に出ない。
+// --model apple で、代わりに Apple の SpeechTranscriber(macOS 26 以降。これもオンデバイス)で認識する。
 // system を「相手」、mic を「自分」として別々のストリームで認識し、無音で発話が区切れるたびに 1 行確定する。
 // 相手が複数いるときのために、system は Sortformer で話者分離して「相手1」「相手2」…と区別する(最大 4 人)。
 // 対面の会議では --in-person を付けると、mic も同じように話者分離して「話者1」「話者2」…になる(自分もその 1 人)。
@@ -8,11 +9,18 @@
 //
 // 準備:   README の「リアルタイム文字起こし」を参照
 // ビルド: make live-transcribe
-// 実行:   ./live-transcribe [--in-person] [model.gguf]   (録音は record-audio と同じ。文字起こしは data/<日時>-live.txt)
+// 実行:   ./live-transcribe [--in-person] [--model nemotron|apple|<model.gguf>]
+//         (録音は record-audio と同じ。文字起こしは data/<日時>-live.txt)
 // 停止:   Ctrl+C(「保存完了」が出るまで待つ)
 
+import AVFoundation
 import CoreAudio
 import Foundation
+import Speech
+
+func failure(_ message: String) -> NSError {
+    NSError(domain: "live-transcribe", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+}
 
 func asrCheck(_ status: nemo_speech_asr_status, _ what: String) throws {
     guard status == NEMO_SPEECH_ASR_OK else {
@@ -102,13 +110,76 @@ func makeDiarizer(model path: String) throws -> OpaquePointer {
     }
 }
 
-// 1 入力ぶんのストリーミング認識。話者分離のモデルを渡すと、話者名に 1 始まりの番号が付く(「相手1」)。
-final class LiveStream {
+// 話者分離のストリーム。認識と同じ音声を並走で渡し、確定した発話の時間帯に最も長く重なる話者を求める。
+// 付加機能なので、失敗しても止めるのは話者分離だけで、文字起こしは番号なしで続ける。
+final class Diarization {
+    private var diar: OpaquePointer?
+
+    init(_ diarizer: OpaquePointer) throws {
+        try asrCheck(nemo_speech_diar_stream_open(diarizer, &diar), "話者分離の開始")
+    }
+
+    func push(_ samples: [Float], sampleRate: Double) {
+        call("話者分離への受け渡し") { nemo_speech_diar_stream_push_f32($0, samples, samples.count, Int32(sampleRate)) }
+    }
+
+    func finish() {
+        call("話者分離の終了") { nemo_speech_diar_stream_finish($0) }
+    }
+
+    func close() {
+        if let diar { nemo_speech_diar_stream_close(diar) }
+        diar = nil
+    }
+
+    // from〜to 秒に最も長く重なっている話者(1 始まり)。止まっているか、重なりが無ければ 0。
+    // 区間の後処理はストリーム全体に及ぶので、確定した発話にだけ使う。
+    func speaker(from: Double, to: Double) -> Int32 {
+        var count = 0
+        guard call("話者分離の結果", { nemo_speech_diar_segments($0, nil, nil, 0, &count) }) else { return 0 }
+        var segments = [nemo_speech_diar_segment](repeating: nemo_speech_diar_segment(), count: count)
+        guard call("話者分離の結果", { nemo_speech_diar_segments($0, nil, &segments, count, &count) }) else { return 0 }
+        var overlap: [Int32: Double] = [:]
+        for segment in segments.prefix(count) {
+            let length = min(to, segment.end_time) - max(from, segment.start_time)
+            if length > 0 { overlap[segment.speaker, default: 0] += length }
+        }
+        return overlap.max { $0.value < $1.value }?.key ?? 0
+    }
+
+    @discardableResult
+    private func call(_ what: String, _ body: (OpaquePointer) -> nemo_speech_asr_status) -> Bool {
+        guard let diar else { return false }
+        if body(diar) == NEMO_SPEECH_ASR_OK { return true }
+        let reason = String(cString: nemo_speech_asr_last_error())
+        fputs("\n話者分離を停止しました(文字起こしは続きます): \(what)に失敗しました: \(reason)\n", console)
+        close()
+        return false
+    }
+}
+
+// 1 入力ぶんのストリーミング認識。push と finish は、確定した発話を「[時刻] 話者: 本文」の行で返す。
+// 話者分離のモデルを渡すと、話者名に 1 始まりの番号が付く(「相手1」)。
+protocol SpeechStream: AnyObject {
+    var onPartial: (_ who: String, _ text: String) -> Void { get set }   // 認識途中の文(確定したら空文字)
+    func push(_ samples: [Float], sampleRate: Double) throws -> [String]
+    func finish() throws -> [String]   // 残りの音声を認識しきる
+    func close()
+}
+
+func line(at seconds: Double, _ who: String, _ speaker: Int32, _ text: String) -> String {
+    let s = Int(seconds)
+    let who = speaker > 0 ? "\(who)\(speaker)" : who
+    return String(format: "[%02d:%02d:%02d] %@: %@", s / 3600, s % 3600 / 60, s % 60, who, text)
+}
+
+// Nemotron(NeMo-Speech.cpp)での認識。サンプルレートの変換は SDK がやってくれる。
+final class NemotronStream: SpeechStream {
     private let who: String
     private var stream: OpaquePointer?
-    private var diar: OpaquePointer?   // 同じ音声を並走で話者分離するストリーム
+    private var diar: Diarization?
     private var start: Float?   // 認識中の発話が始まった時刻(録音開始からの秒)
-    var onPartial: (_ who: String, _ text: String) -> Void = { _, _ in }   // 認識途中の文(確定したら空文字)
+    var onPartial: (_ who: String, _ text: String) -> Void = { _, _ in }
 
     init(_ who: String, recognizer: OpaquePointer, diarizer: OpaquePointer?) throws {
         self.who = who
@@ -119,21 +190,17 @@ final class LiveStream {
             options.language_code = $0
             try asrCheck(nemo_speech_asr_streaming_recognize(recognizer, &options, &stream), "ストリームの開始")
         }
-        if let diarizer {
-            try asrCheck(nemo_speech_diar_stream_open(diarizer, &diar), "話者分離の開始")
-        }
+        diar = try diarizer.map(Diarization.init)
     }
 
-    // 音声を渡し、確定した発話を「[時刻] 話者: 本文」の行で返す。サンプルレートの変換は SDK がやってくれる。
     func push(_ samples: [Float], sampleRate: Double) throws -> [String] {
         try asrCheck(nemo_speech_asr_stream_push_f32(stream, samples, samples.count, Int32(sampleRate)), "音声の受け渡し")
-        _ = withDiar("話者分離への受け渡し") { nemo_speech_diar_stream_push_f32($0, samples, samples.count, Int32(sampleRate)) }
+        diar?.push(samples, sampleRate: sampleRate)
         return try drain()
     }
 
-    // 残りの音声を認識しきる。
     func finish() throws -> [String] {
-        _ = withDiar("話者分離の終了") { nemo_speech_diar_stream_finish($0) }
+        diar?.finish()
         try asrCheck(nemo_speech_asr_stream_finish(stream), "ストリームの終了")
         return try drain()
     }
@@ -142,38 +209,14 @@ final class LiveStream {
     func close() {
         nemo_speech_asr_stream_close(stream)
         stream = nil
-        if let diar { nemo_speech_diar_stream_close(diar) }
-        diar = nil
+        diar?.close()
     }
 
-    // 話者分離を 1 回呼ぶ。付加機能なので、失敗しても止めるのは話者分離だけで、文字起こしは番号なしで続ける。
-    private func withDiar(_ what: String, _ call: (OpaquePointer) -> nemo_speech_asr_status) -> Bool {
-        guard let diar else { return false }
-        if call(diar) == NEMO_SPEECH_ASR_OK { return true }
-        let reason = String(cString: nemo_speech_asr_last_error())
-        fputs("\n話者分離を停止しました(文字起こしは続きます): \(what)に失敗しました: \(reason)\n", console)
-        nemo_speech_diar_stream_close(diar)
-        self.diar = nil
-        return false
-    }
-
-    // 発話の時間帯に最も長く重なっている話者(1 始まり)。話者分離なし、または重なりが無ければ 0。
-    // 区間の後処理はストリーム全体に及ぶので、確定した発話にだけ使う。
     private func speaker(of result: OpaquePointer) -> Int32 {
         let words = nemo_speech_asr_result_word_count(result, 0)
-        guard diar != nil, words > 0 else { return 0 }
-        let from = Double(nemo_speech_asr_result_word_start_time(result, 0, 0)) / 1000
-        let to = Double(nemo_speech_asr_result_word_end_time(result, 0, words - 1)) / 1000
-        var count = 0
-        guard withDiar("話者分離の結果", { nemo_speech_diar_segments($0, nil, nil, 0, &count) }) else { return 0 }
-        var segments = [nemo_speech_diar_segment](repeating: nemo_speech_diar_segment(), count: count)
-        guard withDiar("話者分離の結果", { nemo_speech_diar_segments($0, nil, &segments, count, &count) }) else { return 0 }
-        var overlap: [Int32: Double] = [:]
-        for segment in segments.prefix(count) {
-            let length = min(to, segment.end_time) - max(from, segment.start_time)
-            if length > 0 { overlap[segment.speaker, default: 0] += length }
-        }
-        return overlap.max { $0.value < $1.value }?.key ?? 0
+        guard let diar, words > 0 else { return 0 }
+        return diar.speaker(from: Double(nemo_speech_asr_result_word_start_time(result, 0, 0)) / 1000,
+                            to: Double(nemo_speech_asr_result_word_end_time(result, 0, words - 1)) / 1000)
     }
 
     // 今の時点で出ている結果をすべて受け取る。
@@ -188,11 +231,7 @@ final class LiveStream {
             let text = String(cString: nemo_speech_asr_result_transcript(result, 0)).trimmingCharacters(in: .whitespaces)
             let s = Int(start ?? nemo_speech_asr_result_audio_processed(result))
             if nemo_speech_asr_result_is_final(result) {
-                if !text.isEmpty {
-                    let tag = speaker(of: result)
-                    let who = tag > 0 ? "\(who)\(tag)" : who
-                    lines.append(String(format: "[%02d:%02d:%02d] %@: %@", s / 3600, s % 3600 / 60, s % 60, who, text))
-                }
+                if !text.isEmpty { lines.append(line(at: Double(s), who, speaker(of: result), text)) }
                 start = nil
                 onPartial(who, "")
             } else if !text.isEmpty {
@@ -200,6 +239,133 @@ final class LiveStream {
                 onPartial(who, text)
             }
         }
+    }
+}
+
+// Apple の SpeechTranscriber(SpeechAnalyzer)での認識。これもオンデバイスで、音声は Mac の外に出ない。
+// 結果は別のタスクに非同期で届くので溜めておき、push のたびに呼び出し元(Transcriber のキュー)で受け取る。
+@available(macOS 26, *)
+final class AppleStream: SpeechStream, @unchecked Sendable {
+    private let who: String
+    private let analyzer: SpeechAnalyzer
+    private let input: AsyncStream<AnalyzerInput>.Continuation
+    private let format: AVAudioFormat   // モデルが受け付ける形式。録音から変換して渡す
+    private var converter: AVAudioConverter?
+    private var diar: Diarization?
+    private var reader: Task<Void, Never>?
+    private let lock = NSLock()
+    private var received: [(isFinal: Bool, text: String, range: CMTimeRange)] = []
+    private var readError: Error?
+    var onPartial: (_ who: String, _ text: String) -> Void = { _, _ in }
+
+    // 日本語のモデルが入っていなければダウンロードする(初回のみ)。
+    static func prepare() async throws -> Locale {
+        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "ja-JP")) else {
+            throw failure("Apple の音声認識が日本語に対応していません")
+        }
+        let transcriber = SpeechTranscriber(locale: locale, preset: .timeIndexedProgressiveTranscription)
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            fputs("Apple の日本語モデルをダウンロード中…\n", console)
+            try await request.downloadAndInstall()
+        }
+        return locale
+    }
+
+    init(_ who: String, locale: Locale, diarizer: OpaquePointer?) async throws {
+        self.who = who
+        // 認識途中の文(volatile)と、話者分離と突き合わせる時刻も受け取る
+        let transcriber = SpeechTranscriber(locale: locale, preset: .timeIndexedProgressiveTranscription)
+        analyzer = SpeechAnalyzer(modules: [transcriber])
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            throw failure("Apple の音声認識が受け付ける音声の形式が分かりません")
+        }
+        self.format = format
+        let (sequence, input) = AsyncStream.makeStream(of: AnalyzerInput.self)
+        self.input = input
+        diar = try diarizer.map(Diarization.init)
+        try await analyzer.start(inputSequence: sequence)
+        reader = Task { [unowned self] in
+            do {
+                for try await result in transcriber.results {
+                    let text = String(result.text.characters).trimmingCharacters(in: .whitespaces)
+                    lock.withLock { received.append((result.isFinal, text, result.range)) }
+                }
+            } catch {
+                lock.withLock { readError = error }
+            }
+        }
+    }
+
+    func push(_ samples: [Float], sampleRate: Double) throws -> [String] {
+        let buffer = try convert(samples, sampleRate: sampleRate)
+        if buffer.frameLength > 0 { input.yield(AnalyzerInput(buffer: buffer)) }
+        diar?.push(samples, sampleRate: sampleRate)
+        return try drain()
+    }
+
+    // 呼び出し元のキューを止めたまま、非同期の終了処理と結果の受け取りを待つ。
+    func finish() throws -> [String] {
+        input.finish()
+        diar?.finish()
+        let done = DispatchSemaphore(value: 0)
+        var finishError: Error?
+        Task { [self] in
+            do { try await analyzer.finalizeAndFinishThroughEndOfInput() } catch { finishError = error }
+            await reader?.value
+            done.signal()
+        }
+        done.wait()
+        if let finishError { throw finishError }
+        return try drain()
+    }
+
+    func close() {
+        diar?.close()
+    }
+
+    // 録音(モノラルの Float32)をモデルの形式にする。変換器は前後のサンプルを持ち越すので使い回す。
+    private func convert(_ samples: [Float], sampleRate: Double) throws -> AVAudioPCMBuffer {
+        let source = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: source, frameCapacity: AVAudioFrameCount(samples.count))!
+        buffer.frameLength = buffer.frameCapacity
+        samples.withUnsafeBufferPointer { buffer.floatChannelData![0].update(from: $0.baseAddress!, count: $0.count) }
+        guard let converter = converter ?? AVAudioConverter(from: source, to: format) else {
+            throw failure("音声を Apple の音声認識の形式に変換できません")
+        }
+        self.converter = converter
+        let capacity = AVAudioFrameCount(Double(samples.count) * format.sampleRate / sampleRate) + 1024
+        let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity)!
+        var given = false
+        var error: NSError?
+        converter.convert(to: output, error: &error) { _, status in
+            defer { given = true }
+            status.pointee = given ? .noDataNow : .haveData
+            return given ? nil : buffer
+        }
+        if let error { throw error }
+        return output
+    }
+
+    // ここまでに届いた結果をすべて受け取る。
+    private func drain() throws -> [String] {
+        let (results, error) = lock.withLock {
+            defer { received = [] }
+            return (received, readError)
+        }
+        if let error { throw error }
+        var lines: [String] = []
+        for result in results {
+            if result.isFinal {
+                if !result.text.isEmpty {
+                    let from = result.range.start.seconds, to = result.range.end.seconds
+                    lines.append(line(at: from, who, diar?.speaker(from: from, to: to) ?? 0, result.text))
+                }
+                onPartial(who, "")
+            } else if !result.text.isEmpty {
+                onPartial(who, result.text)
+            }
+        }
+        return lines
     }
 }
 
@@ -224,8 +390,8 @@ func columns(_ text: String) -> Int {
 // 認識は録音の書き込みを待たせないよう専用のキューで行い、状態にはそのキューからしか触らない。
 final class Transcriber: @unchecked Sendable {
     private let queue = DispatchQueue(label: "live-transcribe.asr")
-    private let mic: LiveStream
-    private let system: LiveStream
+    private let mic: SpeechStream
+    private let system: SpeechStream
     private let url: URL
     private let file: FileHandle
     private var lines: [String] = []
@@ -235,9 +401,9 @@ final class Transcriber: @unchecked Sendable {
     // 最下部に今出ている内容。nil なら出さない(端末でないときと、終了処理に入ってから)。
     private var status: String? = isatty(fileno(console)) != 0 ? "" : nil
 
-    init(recognizer: OpaquePointer, diarizer: OpaquePointer?, inPerson: Bool, url: URL) throws {
-        mic = try LiveStream(inPerson ? "話者" : "自分", recognizer: recognizer, diarizer: inPerson ? diarizer : nil)
-        system = try LiveStream("相手", recognizer: recognizer, diarizer: diarizer)
+    init(mic: SpeechStream, system: SpeechStream, url: URL) throws {
+        self.mic = mic
+        self.system = system
         self.url = url
         FileManager.default.createFile(atPath: url.path, contents: nil)
         file = try FileHandle(forWritingTo: url)
@@ -332,26 +498,45 @@ struct Main {
     }
 
     static func run() async throws {
-        var args = CommandLine.arguments.dropFirst()
+        var args = Array(CommandLine.arguments.dropFirst())
         let inPerson = args.contains("--in-person")
         args.removeAll { $0 == "--in-person" }
+        var model = "nemotron"
+        if let i = args.firstIndex(of: "--model"), i + 1 < args.count {
+            model = args[i + 1]
+            args.removeSubrange(i...i + 1)
+        }
+        guard args.isEmpty else {
+            throw failure("使い方: ./live-transcribe [--in-person] [--model nemotron|apple|<model.gguf>]")
+        }
 
         // 録音を始める前に読み込んでおく(10 秒ほどかかる)
-        guard let modelPath = args.first ?? cachedModel("nemotron-3.5-asr-streaming-0.6b") else {
-            throw NSError(domain: "live-transcribe", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "モデルがありません。先に nemo-speech pull nemotron-3.5 を実行してください"])
-        }
         let diarPath = cachedModel("diar_streaming_sortformer_4spk-v2")
         if diarPath == nil {
             fputs("話者分離のモデルがないので話者を区別しません(nemo-speech pull sortformer で有効になります)\n", console)
         }
         fputs("モデルを読み込み中…\n", console)
-        let recognizer = try makeRecognizer(model: modelPath)
         let diarizer = try diarPath.map(makeDiarizer)
+        var recognizer: OpaquePointer?
+        let makeStream: (_ who: String, _ diarizer: OpaquePointer?) async throws -> SpeechStream
+        if model == "apple" {
+            guard #available(macOS 26, *) else { throw failure("Apple のモデルは macOS 26 以降で使えます") }
+            let locale = try await AppleStream.prepare()
+            makeStream = { try await AppleStream($0, locale: locale, diarizer: $1) }
+        } else {
+            guard let path = model == "nemotron" ? cachedModel("nemotron-3.5-asr-streaming-0.6b") : model else {
+                throw failure("モデルがありません。先に nemo-speech pull nemotron-3.5 を実行してください")
+            }
+            let nemotron = try makeRecognizer(model: path)
+            recognizer = nemotron
+            makeStream = { try NemotronStream($0, recognizer: nemotron, diarizer: $1) }
+        }
+        let mic = try await makeStream(inPerson ? "話者" : "自分", inPerson ? diarizer : nil)
+        let system = try await makeStream("相手", diarizer)
 
         let (dir, name) = try newRecording()
         let textURL = dir.appendingPathComponent("\(name)-live.txt")
-        let transcriber = try Transcriber(recognizer: recognizer, diarizer: diarizer, inPerson: inPerson, url: textURL)
+        let transcriber = try Transcriber(mic: mic, system: system, url: textURL)
 
         let recorder = Recorder(dir: dir, name: name)
         recorder.onLevels = { transcriber.showLevels($0) }
@@ -365,7 +550,7 @@ struct Main {
         transcriber.hideStatus()
         recorder.finish()
         try transcriber.finish()
-        nemo_speech_asr_destroy(recognizer)
+        if let recognizer { nemo_speech_asr_destroy(recognizer) }
         if let diarizer { nemo_speech_diar_destroy(diarizer) }
         print("保存完了")
     }
