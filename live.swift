@@ -400,8 +400,8 @@ final class Transcriber: @unchecked Sendable {
     private var partial = (who: "", text: "")
     // 最下部に今出ている内容。nil なら出さない(端末でないときと、終了処理に入ってから)。
     private var status: String? = isatty(fileno(console)) != 0 ? "" : nil
-    // 端末でないとき(TUI から動かすとき)は、最下部の代わりに変わった内容を「認識中: 」「音量: 」の 2 行で出す。
-    // 最後に出した内容。nil なら出さない(端末のときと、終了処理に入ってから)。
+    // 端末でないとき(TUI から動かすとき)は、最下部の代わりに「認識中: 」の行を変わるたびに、「音量: 」の行を毎秒出す。
+    // 最後に出した「認識中: 」の行。nil なら出さない(端末のときと、終了処理に入ってから)。
     private var reported: String? = isatty(fileno(console)) != 0 ? nil : ""
 
     init(mic: SpeechStream, system: SpeechStream, url: URL) throws {
@@ -421,6 +421,7 @@ final class Transcriber: @unchecked Sendable {
     func showLevels(_ text: String) {
         queue.async { [self] in
             levels = text
+            if reported != nil { report(text) }   // 無音が続いても、読み手がいなくなったことに毎秒気づけるように
             drawStatus()
         }
     }
@@ -476,7 +477,13 @@ final class Transcriber: @unchecked Sendable {
     // 内容が変わっていたら最下部の 2 行を描き直す。
     // 折り返すと上書きできなくなるので、認識途中の文は端末の幅に収まる末尾だけを出す。
     private func drawStatus() {
-        report()
+        if let reported {
+            let next = "認識中: \(partial.text.isEmpty ? "" : "\(partial.who): \(partial.text)")"
+            if next != reported {
+                self.reported = next
+                report(next)
+            }
+        }
         guard status != nil else { return }
         var size = winsize()
         let width = ioctl(fileno(console), TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? Int(size.ws_col) : 80
@@ -489,12 +496,9 @@ final class Transcriber: @unchecked Sendable {
         fputs("\r\u{1B}[K\(next)\u{1B}[1A\r", console)
     }
 
-    private func report() {
-        guard let reported else { return }
-        let next = "認識中: \(partial.text.isEmpty ? "" : "\(partial.who): \(partial.text)")\n\(levels)\n"
-        guard next != reported else { return }
-        self.reported = next
-        fputs(next, console)
+    // 端末でないときに 1 行出す。書けなければ読み手(TUI)がいなくなったので、Ctrl+C と同じく停止して保存する。
+    private func report(_ line: String) {
+        if fputs(line + "\n", console) == EOF { kill(getpid(), SIGINT) }
     }
 }
 
@@ -502,6 +506,7 @@ final class Transcriber: @unchecked Sendable {
 struct Main {
     static func main() async {
         silenceSDKLogs()
+        signal(SIGPIPE, SIG_IGN)   // 出力先の TUI が落ちても、殺されずに録音を保存しきる(書き込みの失敗で気づく)
         do {
             try await run()
         } catch {

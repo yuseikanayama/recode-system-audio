@@ -16,7 +16,8 @@ const args = process.argv.slice(2)
 const modelAt = args.indexOf("--model")
 const model = modelAt < 0 ? "nemotron" : (args[modelAt + 1] ?? "")
 
-const renderer = await createCliRenderer({ exitOnCtrlC: false })
+// 終了のシグナルは OpenTUI に任せず stop() で受ける(先に画面を壊されると、子プロセスを止める前に落ちるため)
+const renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [] })
 
 const transcript = new ScrollBoxRenderable(renderer, { stickyScroll: true, stickyStart: "bottom", flexGrow: 1 })
 const partial = new TextRenderable(renderer, { content: "", fg: "#808080", wrapMode: "none", truncate: true })
@@ -48,10 +49,13 @@ screen.add(message)
 renderer.root.add(screen)
 
 // 最下部の 2 行。上が録音の状態、下が live-transcribe / live-minutes からの最新のメッセージ。
+// 警告やエラーは次のメッセージで上書きされるので、画面を閉じたあとにまとめて出す(無音の警告などを見落とさないため)。
 let lastMessage = ""
+const notices = new Set<string>()
 function say(text: string) {
   lastMessage = text
   message.content = text
+  if (/警告|エラー|失敗|停止しました|未送信|終了します/.test(text)) notices.add(text)
 }
 let recordingSince: number | undefined
 let recordingEnded: number | undefined
@@ -96,13 +100,15 @@ async function eachLine(stream: ReadableStream<Uint8Array>, onLine: (line: strin
 }
 
 // 端末でないとき、live-transcribe は確定した行を stdout に、「認識中: 」「音量: 」とそれ以外のメッセージを stderr に出す。
+// 子プロセスは端末から切り離し(detached)、端末を閉じても直接は止まらないようにする。止めるのは stop() だけ。
 const transcribe = Bun.spawn([join(root, "live-transcribe"), ...args], {
   cwd: root,
+  detached: true,
   stdin: "ignore",
   stdout: "pipe",
   stderr: "pipe",
 })
-let minutesProcess: Bun.Subprocess<"ignore", "ignore", "pipe"> | undefined
+let minutesProcess: Bun.Subprocess<"pipe", "ignore", "pipe"> | undefined
 let minutesPath = ""
 
 const transcribeOutput = eachLine(transcribe.stdout, (line) => {
@@ -122,7 +128,8 @@ function startMinutes(transcriptPath: string) {
   minutesPath = transcriptPath.replace(/-live\.txt$/, "-minutes.md")
   minutesProcess = Bun.spawn([join(root, "live-minutes"), transcriptPath], {
     cwd: root,
-    stdin: "ignore",
+    detached: true,
+    stdin: "pipe", // 何も書かない。TUI が死ぬと閉じられ、live-minutes はそれを合図に終わる
     stdout: "ignore",
     stderr: "pipe",
   })
@@ -144,27 +151,43 @@ setInterval(async () => {
 
 // 文字起こしが自分から止まったとき(エラーなど)も、議事録は残りをまとめて終わらせる。画面は q で閉じる。
 void Promise.all([transcribe.exited, transcribeOutput, transcribeErrors]).then(([code]) => {
+  minutesProcess?.kill("SIGINT")
   recordingEnded = Date.now()
   partial.content = ""
   drawStatus()
-  if (!stopping) say(`${lastMessage}(live-transcribe が終了コード ${code} で止まりました。q で閉じます)`)
-  minutesProcess?.kill("SIGINT")
+  if (!stopping) message.content = `${lastMessage}(live-transcribe が終了コード ${code} で止まりました。q で閉じます)`
 })
 
 // 文字起こしを先に止め、最後の行が保存されてから議事録を止める(最後の発言まで議事録に入れるため)。
-renderer.keyInput.on("keypress", async (key) => {
-  if (key.name !== "q" && !(key.ctrl && key.name === "c")) return
+// q / Ctrl+C のほか、端末を閉じたとき・kill されたとき・TUI が例外で落ちるときもここを通して保存を待つ。
+// それでも TUI が先に死んだら、live-transcribe は出力先が閉じたことに気づいて自分で停止・保存する。
+async function stop() {
   if (stopping) return
   stopping = true
+  transcribe.kill("SIGINT")   // 画面の更新で例外が出ても止め損ねないよう、子プロセスへの指示を先にする
   drawStatus()
   say("文字起こしの保存を待っています…")
-  transcribe.kill("SIGINT")
   await transcribe.exited
   if (minutesProcess) {
     say("残りの発言を議事録にまとめています…")
     await minutesProcess.exited
   }
-  renderer.destroy()
-  console.log(minutesPath ? `保存しました: ${minutesPath.replace(/-minutes\.md$/, "-*")}` : "終了しました")
-  process.exit(0)
+  try {
+    renderer.destroy()
+    for (const notice of notices) console.error(notice)
+    console.log(minutesPath ? `保存しました: ${minutesPath.replace(/-minutes\.md$/, "-*")}` : "終了しました")
+  } finally {
+    process.exit(0)
+  }
+}
+
+renderer.keyInput.on("keypress", (key) => {
+  if (key.name === "q" || (key.ctrl && key.name === "c")) void stop()
 })
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, () => void stop())
+for (const event of ["uncaughtException", "unhandledRejection"] as const) {
+  process.on(event, (error) => {
+    notices.add(`TUI のエラー: ${error instanceof Error ? error.message : String(error)}`)
+    void stop()
+  })
+}
