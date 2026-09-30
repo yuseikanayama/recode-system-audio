@@ -15,7 +15,9 @@
 # 出力: data/<日時>-minutes.md(更新のたびに上書き)
 # 停止: Ctrl+C(残っている発言をまとめてから終わる)
 import asyncio
+import os
 import signal
+import stat
 import sys
 import time
 from pathlib import Path
@@ -90,16 +92,33 @@ def show(minutes: str, lines: int, path: Path) -> None:
     print(f"\n--- {time.strftime('%H:%M:%S')} 更新 / 発言 {lines} 行 / {path}", flush=True)
 
 
+# 標準入力がパイプ(live-tui から動かすとき)なら、閉じられたときに親がいなくなったとみなし、
+# Ctrl+C と同じく残りをまとめて終わる(孤児のまま動き続けない)。uv を挟むので親のプロセスは見張れない。
+def watch_stdin(stop: asyncio.Event) -> None:
+    loop, fd = asyncio.get_running_loop(), sys.stdin.fileno()
+    if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+        return
+
+    def on_readable() -> None:
+        if not os.read(fd, 4096):
+            loop.remove_reader(fd)
+            stop.set()
+
+    loop.add_reader(fd, on_readable)
+
+
 async def main() -> None:
     transcript = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else latest_transcript()
     minutes_path = transcript.with_name(transcript.name.replace("-live.txt", "-minutes.md"))
     stop = asyncio.Event()
     asyncio.get_running_loop().add_signal_handler(signal.SIGINT, stop.set)
+    watch_stdin(stop)
 
     offset, lines, pending, minutes, retried = 0, 0, "", "(まだありません)", False
     started = last_growth = time.monotonic()
     failures = 0
-    print(f"{transcript} を追いかけています。議事録 → {minutes_path}\nCtrl+C で停止します", flush=True)
+    # 議事録の画面だけを stdout に出し、状態のメッセージは stderr に出す(live-tui が拾えるように)
+    print(f"{transcript} を追いかけています。議事録 → {minutes_path}\nCtrl+C で停止します", file=sys.stderr, flush=True)
     while True:
         new, offset = read_new(transcript, offset)
         pending += new   # 送れなかった分は次回にまとめて送る
@@ -122,10 +141,10 @@ async def main() -> None:
                 minutes_path.write_text(minutes + "\n", encoding="utf-8")
                 show(minutes, lines, minutes_path)
         if time.monotonic() - last_growth > IDLE_LIMIT:
-            print(f"文字起こしが {IDLE_LIMIT // 60} 分増えていないので終了します", flush=True)
+            print(f"文字起こしが {IDLE_LIMIT // 60} 分増えていないので終了します", file=sys.stderr, flush=True)
             break
         if time.monotonic() - started > MAX_RUNTIME:
-            print(f"{MAX_RUNTIME // 3600} 時間たったので終了します", flush=True)
+            print(f"{MAX_RUNTIME // 3600} 時間たったので終了します", file=sys.stderr, flush=True)
             break
         if stop.is_set():
             # Ctrl+C は claude の子プロセスにも届き、送信中だった更新は失敗する。新しいプロセスで 1 回だけやり直す
@@ -137,7 +156,7 @@ async def main() -> None:
             await asyncio.wait_for(stop.wait(), INTERVAL)
         except asyncio.TimeoutError:
             pass
-    print("保存完了" if not pending else "未送信の発言が残ったまま終了しました", flush=True)
+    print("保存完了" if not pending else "未送信の発言が残ったまま終了しました", file=sys.stderr, flush=True)
 
 
 asyncio.run(main())

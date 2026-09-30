@@ -93,6 +93,19 @@ Claude には [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) 経�
 60 秒ごとに新しい発言をまとめて送り、議事録の全文を描き直します。`data/<日時>-minutes.md` にも同じ内容を保存します。
 Ctrl+C で止めると、残っている発言をまとめてから終わります。文字起こしの内容は Claude(Anthropic)に送られます。
 
+## ターミナル UI
+
+`live-transcribe` と `live-minutes` を裏で動かし、文字起こし(左)・議事録(右)・録音の状態(下)を 1 画面にまとめます。
+[OpenTUI](https://github.com/anomalyco/opentui) で作っていて、[Bun](https://bun.sh) が必要です。
+
+```sh
+brew install bun             # 初回のみ(依存は初回の起動時に tui/ へ入る)
+./live-tui                   # 引数は live-transcribe と同じ(--in-person、--model apple など)
+```
+
+`q` か Ctrl+C で止めると、文字起こしの保存を待ち、残りの発言を議事録にまとめてから閉じます。
+保存先は、それぞれを単体で動かしたときと同じ `data/<日時>-*` です。
+
 ## 権限
 
 初回実行時に「システムオーディオ録音」と「マイク」の許可ダイアログが出ます。
