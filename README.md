@@ -100,8 +100,10 @@ Ctrl+C で止めると、残っている発言をまとめてから終わりま�
 
 ```sh
 brew install bun             # 初回のみ(依存は初回の起動時に tui/ へ入る)
-./live-tui                   # 引数は live-transcribe と同じ(--in-person、--model apple など)
+./live-tui                   # 引数は live-transcribe と同じ(--in-person、--model nemotron など)
 ```
+
+`live-tui` だけは `--model` の既定が `apple` です。Nemotron を使うときは `--model nemotron` を付けてください。
 
 `q` か Ctrl+C で止めると、文字起こしの保存を待ち、残りの発言を議事録にまとめてから閉じます。
 保存先は、それぞれを単体で動かしたときと同じ `data/<日時>-*` です。

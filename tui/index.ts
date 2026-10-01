@@ -1,5 +1,5 @@
 // live-transcribe と live-minutes を裏で動かし、文字起こし・議事録・録音の状態を 1 画面にまとめる TUI(OpenTUI)。
-// 実行: ./live-tui [--in-person] [--model nemotron|apple|<model.gguf>]   (引数は live-transcribe にそのまま渡す)
+// 実行: ./live-tui [--in-person] [--model apple|nemotron|<model.gguf>]   (引数は live-transcribe にそのまま渡す。--model の既定は apple)
 // 停止: q か Ctrl+C。文字起こしを止めて保存を待ち、残りの発言を議事録にまとめてから閉じる
 import {
   BoxRenderable,
@@ -13,8 +13,8 @@ import { join } from "node:path"
 
 const root = join(import.meta.dir, "..")
 const args = process.argv.slice(2)
-const modelAt = args.indexOf("--model")
-const model = modelAt < 0 ? "nemotron" : (args[modelAt + 1] ?? "")
+if (!args.includes("--model")) args.push("--model", "apple")
+const model = args[args.indexOf("--model") + 1] ?? ""
 
 // 終了のシグナルは OpenTUI に任せず stop() で受ける(先に画面を壊されると、子プロセスを止める前に落ちるため)
 const renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [] })
