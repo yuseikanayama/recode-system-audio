@@ -1,6 +1,8 @@
 SWIFTC = swiftc -swift-version 5 -parse-as-library -O -target arm64-apple-macos14.2
 # NeMo-Speech.cpp のインストール先(live-transcribe だけが使う)
 NEMO ?= $(HOME)/Library/Application Support/NeMoSpeech
+# make install で live-tui を mtg という名前で起動できるようにするシンボリックリンクを置く場所(PATH が通っていること)
+BINDIR ?= $(HOME)/.local/bin
 
 all: record-audio play-audio
 
@@ -14,7 +16,11 @@ live-transcribe: live.swift recorder.swift
 	$(SWIFTC) $^ -import-objc-header "$(NEMO)/include/nemo_speech/diar.h" -I "$(NEMO)/include" \
 		-L "$(NEMO)/lib" -lnemo_speech_asr_c -Xlinker -rpath -Xlinker "$(NEMO)/lib" -o $@
 
+install:
+	mkdir -p "$(BINDIR)"
+	ln -sf "$(CURDIR)/live-tui" "$(BINDIR)/mtg"
+
 clean:
 	rm -f record-audio play-audio live-transcribe
 
-.PHONY: all clean
+.PHONY: all install clean
