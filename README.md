@@ -100,8 +100,13 @@ Ctrl+C で止めると、残っている発言をまとめてから終わりま�
 
 ```sh
 brew install bun             # 初回のみ(依存は初回の起動時に tui/ へ入る)
-./live-tui                   # 引数は live-transcribe と同じ(--in-person、--model apple など)
+./live-tui                   # 引数は live-transcribe と同じ(--in-person、--model nemotron など)
 ```
+
+`live-tui` だけは `--model` の既定が `apple` です。Nemotron を使うときは `--model nemotron` を付けてください。
+
+`make install` で `~/.local/bin/mtg` にシンボリックリンクを置くと、どのディレクトリからでも `mtg` で起動できます(`~/.local/bin` に PATH が通っていること。置き場所は `make install BINDIR=...` で変えられます)。
+引数は `./live-tui` と同じです。保存先はどこから起動してもこのリポジトリの `data/` です。やめるときは `rm ~/.local/bin/mtg` で消してください。
 
 `q` か Ctrl+C で止めると、文字起こしの保存を待ち、残りの発言を議事録にまとめてから閉じます。
 保存先は、それぞれを単体で動かしたときと同じ `data/<日時>-*` です。

@@ -1,5 +1,6 @@
 #!/bin/sh
 # live-transcribe と live-minutes を 1 画面で動かす TUI(tui/index.ts)を起動する。Bun が必要(brew install bun)
-dir="$(cd "$(dirname "$0")" && pwd)"
+# シンボリックリンク(make install で作る ~/.local/bin/mtg)から起動されても、リンクの実体からリポジトリを見つける
+dir="$(dirname "$(realpath "$0")")"
 [ -d "$dir/tui/node_modules" ] || bun install --cwd "$dir/tui" >&2 || exit 1
 exec bun "$dir/tui/index.ts" "$@"
